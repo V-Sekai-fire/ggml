@@ -673,6 +673,20 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
         .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
     },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
+    },
+    [GGML_TYPE_F8_E5M2] = {
+        .type_name                = "f8_e5m2",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e5m2,
+    },
     [GGML_TYPE_Q1_0] = {
         .type_name                = "q1_0",
         .blck_size                = QK1_0,
@@ -1098,9 +1112,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "QUANTIZE_I8_CONVROT",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1229,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "quantize_i8_convrot(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3292,6 +3310,52 @@ struct ggml_tensor * ggml_mul_mat(
     return result;
 }
 
+GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * weight_scale,
+        struct ggml_tensor  * bias,
+        int                   convrot_group_size) {
+    GGML_ASSERT(weight->type == GGML_TYPE_I8);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 || input->type == GGML_TYPE_I8);
+    GGML_ASSERT(weight_scale != NULL && weight_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(weight_scale));
+    GGML_ASSERT(ggml_nelements(weight_scale) == weight->ne[1]);
+    GGML_ASSERT(bias == NULL || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias)));
+    GGML_ASSERT(bias == NULL || ggml_nelements(bias) == weight->ne[1]);
+    GGML_ASSERT(convrot_group_size == 0 || weight->ne[0] % convrot_group_size == 0);
+
+    int n = convrot_group_size;
+    while (n > 1 && n % 4 == 0) {
+        n /= 4;
+    }
+    GGML_ASSERT(n == 0 || n == 1);
+
+    const struct ggml_tensor * logical_input = input;
+    if (input->type == GGML_TYPE_I8) {
+        GGML_ASSERT(input->op == GGML_OP_QUANTIZE_I8_CONVROT);
+        GGML_ASSERT(input->src[0] != NULL);
+        logical_input = input->src[0];
+        const int64_t rows_padded = GGML_PAD(ggml_nrows(logical_input), 4);
+        const int64_t scale_rows  = (ggml_nrows(logical_input) * (int64_t)sizeof(float) + weight->ne[0] - 1) /
+                                    weight->ne[0];
+        GGML_ASSERT(input->ne[0] == weight->ne[0]);
+        GGML_ASSERT(input->ne[1] == rows_padded + scale_rows);
+    }
+    GGML_ASSERT(ggml_can_mul_mat(weight, logical_input));
+
+    const int64_t ne[4] = { weight->ne[1], logical_input->ne[1], logical_input->ne[2], logical_input->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op                  = GGML_OP_MUL_MAT;
+    result->src[0]              = weight;
+    result->src[1]              = input;
+    result->src[2]              = weight_scale;
+    result->src[3]              = bias;
+    ggml_set_op_params_i32(result, 2, convrot_group_size);
+    return result;
+}
+
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
@@ -3310,6 +3374,30 @@ void ggml_mul_mat_set_hint(
     const int32_t hint_i32 = (int32_t) hint;
 
     ggml_set_op_params_i32(a, 1, hint_i32);
+}
+
+struct ggml_tensor * ggml_quantize_i8_convrot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   group_size) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(group_size > 0 && a->ne[0] % group_size == 0);
+
+    int n = group_size;
+    while (n > 1 && n % 4 == 0) {
+        n /= 4;
+    }
+    GGML_ASSERT(n == 1);
+
+    const int64_t rows_padded = GGML_PAD(ggml_nrows(a), 4);
+    const int64_t scale_rows  = (ggml_nrows(a) * (int64_t)sizeof(float) + a->ne[0] - 1) / a->ne[0];
+    const int64_t ne[2]       = { a->ne[0], rows_padded + scale_rows };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I8, 2, ne);
+    result->op                  = GGML_OP_QUANTIZE_I8_CONVROT;
+    result->src[0]              = a;
+    ggml_set_op_params_i32(result, 0, group_size);
+    return result;
 }
 
 // ggml_mul_mat_id
@@ -7200,6 +7288,10 @@ void ggml_build_forward_expand(struct ggml_cgraph * cgraph, struct ggml_tensor *
     ggml_build_forward_impl(cgraph, tensor, true, true);
 }
 
+void ggml_build_forward_order(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
+    ggml_build_forward_impl(cgraph, tensor, true, false);
+}
+
 void ggml_build_backward_expand(
         struct ggml_context *  ctx,
         struct ggml_cgraph  *  cgraph,
@@ -7854,7 +7946,9 @@ void ggml_set_input(struct ggml_tensor * tensor) {
 }
 
 void ggml_set_output(struct ggml_tensor * tensor) {
-    tensor->flags |= GGML_TENSOR_FLAG_OUTPUT;
+    for (struct ggml_tensor * cur = tensor; cur != NULL; cur = cur->view_src) {
+        cur->flags |= GGML_TENSOR_FLAG_OUTPUT;
+    }
 }
 
 void ggml_set_param(struct ggml_tensor * tensor) {
